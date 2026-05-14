@@ -260,6 +260,8 @@ def init_db() -> None:
                 conn.execute("ALTER TABLE users ADD COLUMN cooking_preference TEXT")
             if not _has_column("users", "is_blocked"):
                 conn.execute("ALTER TABLE users ADD COLUMN is_blocked SMALLINT NOT NULL DEFAULT 0")
+            if not _has_column("users", "openai_api_key"):
+                conn.execute("ALTER TABLE users ADD COLUMN openai_api_key TEXT")
 
             admin_user = conn.execute("SELECT id FROM users WHERE is_admin = 1 ORDER BY id ASC LIMIT 1").fetchone()
             if not admin_user:
@@ -386,6 +388,8 @@ def init_db() -> None:
                 conn.execute("ALTER TABLE users ADD COLUMN cooking_preference TEXT")
             if not _has_column("users", "is_blocked"):
                 conn.execute("ALTER TABLE users ADD COLUMN is_blocked INTEGER NOT NULL DEFAULT 0")
+            if not _has_column("users", "openai_api_key"):
+                conn.execute("ALTER TABLE users ADD COLUMN openai_api_key TEXT")
 
             admin_user = conn.execute("SELECT id FROM users WHERE is_admin = 1 ORDER BY id ASC LIMIT 1").fetchone()
             if not admin_user:
@@ -516,6 +520,32 @@ def authenticate_user(identifier: str, password: str) -> Optional[dict]:
         "is_blocked": bool(int(row["is_blocked"] or 0)),
         "created_at": str(row["created_at"] or ""),
     }
+
+
+def save_openai_api_key(user_id: int, api_key: str) -> bool:
+    """Save the OpenAI API key for a user."""
+    try:
+        with get_connection() as conn:
+            conn.execute(
+                "UPDATE users SET openai_api_key = %s WHERE id = %s",
+                (api_key if api_key else None, user_id),
+            )
+        return True
+    except Exception:
+        return False
+
+
+def get_openai_api_key(user_id: int) -> Optional[str]:
+    """Retrieve the OpenAI API key for a user."""
+    try:
+        with get_connection() as conn:
+            row = conn.execute(
+                "SELECT openai_api_key FROM users WHERE id = %s",
+                (user_id,),
+            ).fetchone()
+        return str(row["openai_api_key"]) if row and row["openai_api_key"] else None
+    except Exception:
+        return None
 
 
 def reset_user_password(username: str, email: str, new_password: str) -> tuple[bool, str]:

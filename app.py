@@ -36,6 +36,7 @@ from db import (
     export_recipes_records,
     get_categories,
     get_difficulties,
+    get_openai_api_key as db_get_openai_api_key,
     get_recipe,
     get_user_by_id,
     import_recipes_records,
@@ -45,6 +46,7 @@ from db import (
     list_recipe_options,
     list_users_with_stats,
     reset_user_password,
+    save_openai_api_key as db_save_openai_api_key,
     set_user_blocked,
     set_favorite,
     set_rating,
@@ -90,6 +92,10 @@ def page_auth() -> None:
             if user:
                 st.session_state["auth_user"] = user
                 st.session_state["page"] = "Browse Recipes"
+                # Load saved OpenAI API key from database
+                saved_key = db_get_openai_api_key(user["id"])
+                if saved_key:
+                    st.session_state["openai_api_key"] = saved_key
                 st.success(f"Welcome, {user['username']}! 👋")
                 st.rerun()
             else:
@@ -376,6 +382,31 @@ def inject_styles() -> None:
             border-radius: 8px !important;
             padding: 10px 12px !important;
             transition: all 0.3s ease !important;
+        }
+
+        /* Force selectbox selected value visibility */
+        .stSelectbox [data-baseweb="select"] [role="combobox"] {
+            color: inherit !important;
+            fill: currentColor !important;
+            opacity: 1 !important;
+            visibility: visible !important;
+            display: flex !important;
+            align-items: center !important;
+        }
+
+        .stSelectbox [data-baseweb="select"] [role="combobox"] > div,
+        .stSelectbox [data-baseweb="select"] [role="combobox"] span {
+            color: inherit !important;
+            opacity: 1 !important;
+            visibility: visible !important;
+            display: inline-block !important;
+        }
+
+        .stSelectbox [role="combobox"] > *,
+        .stMultiSelect [role="combobox"] > * {
+            color: inherit !important;
+            opacity: 1 !important;
+            visibility: visible !important;
         }
 
         .stTextInput > div > div > input:focus,
@@ -911,135 +942,97 @@ def parse_recipe_from_web_url(url_text: str) -> tuple[dict, str]:
 
 
 def get_ai_provider() -> str:
-    provider = str(st.session_state.get("ai_provider", "openai")).strip().lower()
-    if provider not in {"openai", "github"}:
-        return "openai"
-    return provider
+    """Always return openai provider (ChatGPT only)."""
+    return "openai"
 
 
 def get_ai_token(provider: str | None = None) -> tuple[str, str]:
     """
-    Retrieve AI token with priority: sidebar input -> secrets -> env var.
-    Returns: (token, source) where source is "sidebar", "secrets", "env", or "none".
+    Retrieve OpenAI API key with priority: session state -> secrets -> env var.
+    Returns: (token, source) where source is "session", "secrets", "env", or "none".
     """
-    current_provider = (provider or get_ai_provider()).strip().lower()
+    # Check session state first (loaded from database on login or entered in sidebar)
+    session_value = str(st.session_state.get("openai_api_key", "")).strip()
+    if session_value:
+        return session_value, "session"
 
-    if current_provider == "openai":
-        sidebar_value = str(st.session_state.get("openai_api_key_input", "")).strip()
-        if sidebar_value:
-            return sidebar_value, "sidebar"
-
-        secret_value = ""
-        try:
-            secret_value = str(st.secrets.get("OPENAI_API_KEY", "")).strip()
-        except Exception:
-            secret_value = ""
-        if secret_value:
-            return secret_value, "secrets"
-
-        env_value = str(os.getenv("OPENAI_API_KEY") or "").strip()
-        if env_value:
-            return env_value, "env"
-        return "", "none"
-
-    sidebar_value = str(st.session_state.get("github_token_input", "")).strip()
-    if not sidebar_value:
-        sidebar_value = str(st.session_state.get("ai_api_key_input", "")).strip()
-    if sidebar_value:
-        return sidebar_value, "sidebar"
-
+    # Check streamlit secrets
     secret_value = ""
     try:
-        secret_value = str(st.secrets.get("GITHUB_TOKEN", "")).strip()
+        secret_value = str(st.secrets.get("OPENAI_API_KEY", "")).strip()
     except Exception:
         secret_value = ""
     if secret_value:
         return secret_value, "secrets"
 
-    env_value = str(os.getenv("GITHUB_TOKEN") or "").strip()
+    # Check environment variable
+    env_value = str(os.getenv("OPENAI_API_KEY") or "").strip()
     if env_value:
         return env_value, "env"
-
+    
     return "", "none"
 
 
-def get_github_token() -> tuple[str, str]:
-    """Backward-compatible helper for GitHub Models token retrieval."""
-    return get_ai_token("github")
-
-
 def setup_ai_api_key_sidebar() -> None:
-    """Render provider selection and session-level API key inputs in sidebar."""
-    st.sidebar.markdown("---")
-    st.sidebar.markdown("**🤖 AI Recipe Assistant**")
+    """Render OpenAI API key input in sidebar and save to database."""
+    # Initialize session state for ChatGPT model
+    if "chatgpt_model" not in st.session_state:
+        st.session_state["chatgpt_model"] = "gpt-4o-mini"
 
-    provider = st.sidebar.selectbox(
-        "AI provider",
-        options=["openai", "github"],
-        format_func=lambda value: "OpenAI (ChatGPT API)" if value == "openai" else "GitHub Models",
-        key="ai_provider",
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("**🤖 AI Recipe Assistant (ChatGPT)**")
+
+    # Display current model selection as radio buttons
+    model_options = ["gpt-4o-mini", "gpt-4o", "gpt-4.1-mini"]
+    current_model = st.session_state.get("chatgpt_model", "gpt-4o-mini")
+    model_idx = model_options.index(current_model) if current_model in model_options else 0
+
+    st.sidebar.radio(
+        "Model",
+        options=model_options,
+        index=model_idx,
+        key="chatgpt_model",
+        horizontal=False,
     )
 
-    if provider == "openai":
-        openai_model = st.sidebar.selectbox(
-            "Model",
-            options=["gpt-4o-mini", "gpt-4o", "gpt-4.1-mini"],
-            key="openai_model",
-        )
-        st.session_state["ai_model"] = openai_model
-    else:
-        github_model = st.sidebar.selectbox(
-            "Model",
-            options=["gpt-4o", "gpt-4.1"],
-            key="github_model",
-        )
-        st.session_state["ai_model"] = github_model
+    # OpenAI API key input - with save to database
+    api_key_input = st.sidebar.text_input(
+        "OpenAI API key",
+        value=st.session_state.get("openai_api_key", ""),
+        type="password",
+        placeholder="sk-...",
+    )
+
+    # Save API key to database when it changes
+    if api_key_input and api_key_input != st.session_state.get("openai_api_key", ""):
+        if st.session_state.get("auth_user"):
+            user_id = st.session_state["auth_user"]["id"]
+            success = db_save_openai_api_key(user_id, api_key_input)
+            if success:
+                st.session_state["openai_api_key"] = api_key_input
+                st.sidebar.success("✅ API key saved!")
+            else:
+                st.sidebar.error("Failed to save API key")
+
+    # Clear key button
+    if st.sidebar.button("Clear Key", key="clear_api_key"):
+        if st.session_state.get("auth_user"):
+            user_id = st.session_state["auth_user"]["id"]
+            db_save_openai_api_key(user_id, "")
+            st.session_state["openai_api_key"] = ""
+            st.rerun()
 
     # Check if API key is available
-    api_key, source = get_ai_token(provider)
+    api_key, source = get_ai_token()
     status_icon = "✅" if api_key else "⚠️"
     
     with st.sidebar.expander(f"{status_icon} Connect AI", expanded=not bool(api_key)):
-        if provider == "openai":
-            st.markdown(
-                "**Get your OpenAI API key:**\n"
-                "1. Go to [platform.openai.com](https://platform.openai.com/account/api-keys)\n"
-                "2. Create a new API key\n"
-                "3. Paste it below (not stored on disk, session only)"
-            )
-            st.text_input(
-                "OpenAI API key",
-                value=st.session_state.get("openai_api_key_input", ""),
-                type="password",
-                key="openai_api_key_input",
-                placeholder="sk-...",
-                help="Session only. Not written to disk.",
-            )
-            col1, col2 = st.columns([1, 1])
-            with col1:
-                if st.button("Clear Key", key="clear_openai_key_btn", use_container_width=True):
-                    st.session_state.pop("openai_api_key_input", None)
-                    st.rerun()
-        else:
-            st.markdown(
-                "**Get your GitHub token:**\n"
-                "1. Go to [github.com/settings/tokens](https://github.com/settings/tokens)\n"
-                "2. Create a Personal Access Token\n"
-                "3. Paste it below (not stored on disk, session only)"
-            )
-            st.text_input(
-                "GitHub token",
-                value=st.session_state.get("github_token_input", ""),
-                type="password",
-                key="github_token_input",
-                placeholder="ghp_...",
-                help="Session only. Not written to disk.",
-            )
-            col1, col2 = st.columns([1, 1])
-            with col1:
-                if st.button("Clear Token", key="clear_github_key_btn", use_container_width=True):
-                    st.session_state.pop("github_token_input", None)
-                    st.rerun()
+        st.markdown(
+            "**Get your OpenAI API key:**\n"
+            "1. Go to [platform.openai.com](https://platform.openai.com/account/api-keys)\n"
+            "2. Create a new API key\n"
+            "3. Paste it below (saves to your profile for next login)"
+        )
 
 
 # Keep the old name as an alias so existing call sites keep working.
@@ -1071,7 +1064,7 @@ def call_chatgpt_for_recipe(user_prompt: str) -> dict:
         )
 
     payload = {
-        "model": str(st.session_state.get("ai_model") or ("gpt-4o-mini" if provider == "openai" else "gpt-4o")),
+        "model": str(st.session_state.get("chatgpt_model", "gpt-4o-mini")),
         "messages": [
             {
                 "role": "system",
