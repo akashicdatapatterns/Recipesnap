@@ -231,6 +231,18 @@ def init_db() -> None:
             conn.execute("CREATE INDEX IF NOT EXISTS idx_meal_plan_date   ON meal_plan_entries(meal_date)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_meal_plan_recipe ON meal_plan_entries(recipe_id)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_recipes_user     ON recipes(user_id)")
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS user_sessions (
+                    id         SERIAL PRIMARY KEY,
+                    user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    token      VARCHAR(128) NOT NULL UNIQUE,
+                    expires_at TIMESTAMPTZ NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+                """
+            )
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_user_sessions_token ON user_sessions(token)")
 
             if not _has_column("recipes", "is_favorite"):
                 conn.execute("ALTER TABLE recipes ADD COLUMN is_favorite SMALLINT NOT NULL DEFAULT 0")
@@ -356,9 +368,21 @@ def init_db() -> None:
                 )
                 """
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS user_sessions (
+                    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    token      TEXT NOT NULL UNIQUE,
+                    expires_at TEXT NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
             conn.execute("CREATE INDEX IF NOT EXISTS idx_meal_plan_date   ON meal_plan_entries(meal_date)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_meal_plan_recipe ON meal_plan_entries(recipe_id)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_recipes_user     ON recipes(user_id)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_user_sessions_token ON user_sessions(token)")
 
             if not _has_column("recipes", "is_favorite"):
                 conn.execute("ALTER TABLE recipes ADD COLUMN is_favorite INTEGER NOT NULL DEFAULT 0")
@@ -546,6 +570,91 @@ def get_openai_api_key(user_id: int) -> Optional[str]:
         return str(row["openai_api_key"]) if row and row["openai_api_key"] else None
     except Exception:
         return None
+
+
+# ---------------------------------------------------------------------------
+# Persistent session helpers (remember-me / auto-login via cookie)
+# ---------------------------------------------------------------------------
+
+SESSION_DURATION_DAYS = 30
+
+
+def create_user_session(user_id: int) -> str:
+    """Create a new persistent session token for *user_id* and return it.
+    Tokens are valid for SESSION_DURATION_DAYS days.
+    Old expired sessions for this user are pruned at the same time.
+    """
+    import datetime as _dt
+
+    token = secrets.token_hex(48)  # 96-char hex string
+    now = _dt.datetime.utcnow()
+    expires = now + _dt.timedelta(days=SESSION_DURATION_DAYS)
+    expires_str = expires.isoformat()
+
+    with get_connection() as conn:
+        # Prune expired sessions for this user
+        conn.execute(
+            "DELETE FROM user_sessions WHERE user_id = %s AND expires_at < %s",
+            (user_id, now.isoformat()),
+        )
+        conn.execute(
+            "INSERT INTO user_sessions (user_id, token, expires_at) VALUES (%s, %s, %s)",
+            (user_id, token, expires_str),
+        )
+    return token
+
+
+def get_session_user(token: str) -> Optional[dict]:
+    """Validate *token* and return the user dict if the session is still valid."""
+    import datetime as _dt
+
+    if not token:
+        return None
+    now = _dt.datetime.utcnow().isoformat()
+    try:
+        with get_connection() as conn:
+            row = conn.execute(
+                """
+                SELECT u.id, u.username, u.email, u.full_name, u.phone, u.city, u.country,
+                       u.cooking_preference, u.is_admin, u.is_blocked, u.created_at
+                FROM user_sessions s
+                JOIN users u ON u.id = s.user_id
+                WHERE s.token = %s AND s.expires_at > %s
+                LIMIT 1
+                """,
+                (token, now),
+            ).fetchone()
+    except Exception:
+        return None
+
+    if not row:
+        return None
+    if bool(int(row.get("is_blocked") or 0)):
+        return None
+    return {
+        "id": int(row["id"]),
+        "username": str(row["username"]),
+        "email": str(row["email"]),
+        "full_name": str(row["full_name"] or ""),
+        "phone": str(row["phone"] or ""),
+        "city": str(row["city"] or ""),
+        "country": str(row["country"] or ""),
+        "cooking_preference": str(row["cooking_preference"] or ""),
+        "is_admin": bool(int(row["is_admin"] or 0)),
+        "is_blocked": False,
+        "created_at": str(row["created_at"] or ""),
+    }
+
+
+def delete_user_session(token: str) -> None:
+    """Delete a single session token (logout)."""
+    if not token:
+        return
+    try:
+        with get_connection() as conn:
+            conn.execute("DELETE FROM user_sessions WHERE token = %s", (token,))
+    except Exception:
+        pass
 
 
 def reset_user_password(username: str, email: str, new_password: str) -> tuple[bool, str]:

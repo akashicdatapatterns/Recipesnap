@@ -31,13 +31,16 @@ from db import (
     authenticate_user,
     create_user,
     create_recipe,
-    delete_meal_plan_entry,
+    create_user_session,
     delete_recipe,
+    delete_user_session,
+    delete_meal_plan_entry,
     export_recipes_records,
     get_categories,
     get_difficulties,
     get_openai_api_key as db_get_openai_api_key,
     get_recipe,
+    get_session_user,
     get_user_by_id,
     import_recipes_records,
     init_db,
@@ -96,6 +99,20 @@ def page_auth() -> None:
                 saved_key = db_get_openai_api_key(user["id"])
                 if saved_key:
                     st.session_state["openai_api_key"] = saved_key
+                # Create persistent session token and store in cookie
+                try:
+                    import extra_streamlit_components as stx
+                    import datetime
+                    token = create_user_session(user["id"])
+                    st.session_state["cv_session_token"] = token
+                    _cm = stx.CookieManager(key="cv_cookie_mgr_login")
+                    _cm.set(
+                        "cv_session",
+                        token,
+                        expires_at=datetime.datetime.now() + datetime.timedelta(days=30),
+                    )
+                except Exception:
+                    pass
                 st.success(f"Welcome, {user['username']}! 👋")
                 st.rerun()
             else:
@@ -495,6 +512,65 @@ def inject_styles() -> None:
         }
         ::-webkit-scrollbar-thumb:hover {
             background: var(--secondary-color);
+        }
+
+        /* ── Responsive typography ── */
+        /* Fluid base font: scales from 14px on small phones to 16px on desktop */
+        html {
+            font-size: clamp(14px, 3.5vw, 16px) !important;
+        }
+
+        /* Headings scale proportionally on narrow viewports */
+        @media (max-width: 768px) {
+            h1 { font-size: clamp(1.5rem, 6vw, 2.5rem) !important; }
+            h2 { font-size: clamp(1.25rem, 5vw, 2rem) !important; }
+            h3 { font-size: clamp(1.1rem, 4vw, 1.5rem) !important; }
+
+            /* Body text and inputs stay readable */
+            p, li, td, th, label,
+            .stTextInput input,
+            .stTextArea textarea,
+            .stSelectbox [data-baseweb="select"],
+            .stNumberInput input,
+            .stRadio label,
+            .stCheckbox label {
+                font-size: clamp(0.875rem, 3.5vw, 1rem) !important;
+            }
+
+            /* Sidebar text */
+            [data-testid="stSidebar"] * {
+                font-size: clamp(0.8rem, 3vw, 0.95rem) !important;
+            }
+
+            /* Pill badges */
+            .cv-pill {
+                font-size: clamp(0.75rem, 2.8vw, 0.85rem) !important;
+            }
+
+            /* Buttons: keep text legible, allow natural wrapping */
+            .stButton > button {
+                font-size: clamp(0.85rem, 3vw, 1rem) !important;
+                padding: 10px 16px !important;
+                white-space: normal !important;
+            }
+
+            /* Chat messages */
+            [data-testid="stChatMessageContent"] {
+                font-size: clamp(0.85rem, 3.2vw, 1rem) !important;
+            }
+        }
+
+        /* Very small screens (phones < 480px) */
+        @media (max-width: 480px) {
+            html { font-size: 14px !important; }
+
+            h1 { font-size: clamp(1.25rem, 7vw, 1.75rem) !important; }
+            h2 { font-size: clamp(1.1rem, 6vw, 1.4rem) !important; }
+            h3 { font-size: clamp(1rem, 5vw, 1.2rem) !important; }
+
+            .stButton > button {
+                padding: 9px 12px !important;
+            }
         }
     """
     st.markdown(f"<style>{css}</style>", unsafe_allow_html=True)
@@ -2270,6 +2346,7 @@ def page_cook_mode() -> None:
                     st.session_state["cook_mode_target_servings"] = target_servings_map
                     st.session_state["cook_recipe_index"] = 0
                     st.session_state["cook_step_index"] = 0
+                    st.session_state["scroll_to_cook"] = True
                     st.rerun()
         with controls_2:
             if st.button("Reset Cook Mode"):
@@ -2311,6 +2388,19 @@ def page_cook_mode() -> None:
     st.session_state["cook_step_index"] = step_index
 
     recipe_name = current_recipe.get("title") or f"Recipe {current_recipe.get('id')}"
+
+    # Anchor + scroll trigger: on mobile, "Start Cooking" scrolls here
+    st.markdown('<div id="cv-cook-top"></div>', unsafe_allow_html=True)
+    if st.session_state.pop("scroll_to_cook", False):
+        import streamlit.components.v1 as _stc
+        _stc.html(
+            "<script>"
+            "var el=window.parent.document.getElementById('cv-cook-top');"
+            "if(el){el.scrollIntoView({behavior:'smooth',block:'start'});}"
+            "</script>",
+            height=0,
+        )
+
     with main_col:
         st.markdown(f"### {recipe_name}")
         st.caption(
@@ -2391,6 +2481,25 @@ def main() -> None:
     inject_styles()
     render_header()
 
+    # --- Persistent session via cookie ---
+    try:
+        import extra_streamlit_components as stx
+        cookie_manager = stx.CookieManager(key="cv_cookie_mgr")
+        session_token = cookie_manager.get("cv_session")
+    except Exception:
+        cookie_manager = None
+        session_token = None
+
+    # Auto-restore session from cookie if not already logged in
+    if not get_active_user() and session_token:
+        restored_user = get_session_user(session_token)
+        if restored_user:
+            st.session_state["auth_user"] = restored_user
+            st.session_state["cv_session_token"] = session_token
+            saved_key = db_get_openai_api_key(restored_user["id"])
+            if saved_key:
+                st.session_state["openai_api_key"] = saved_key
+
     if not get_active_user():
         page_auth()
         return
@@ -2426,6 +2535,16 @@ def main() -> None:
     st.sidebar.caption(f"Logged in as {active_user.get('username')} ({role})")
 
     if st.sidebar.button("Logout", use_container_width=True):
+        # Invalidate persistent session
+        token = st.session_state.pop("cv_session_token", None)
+        if token:
+            delete_user_session(token)
+        try:
+            import extra_streamlit_components as stx
+            _cm = stx.CookieManager(key="cv_cookie_mgr_logout")
+            _cm.delete("cv_session")
+        except Exception:
+            pass
         for key in [
             "auth_user",
             "page",
