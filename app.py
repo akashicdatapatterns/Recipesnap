@@ -357,11 +357,17 @@ def inject_styles() -> None:
             --primary-color: #ff6b6b;
             --secondary-color: #4ecdc4;
             --accent-color: #ffe66d;
+            --ui-font: "Trebuchet MS", "Segoe UI", Verdana, Tahoma, sans-serif;
+            --chat-user-bg: #fff2bf;
+            --chat-user-border: #e5c452;
+            --chat-assistant-bg: #e6faf7;
+            --chat-assistant-border: #3fb5ab;
         }
 
         html, body, .stApp, p, h1, h2, h3, h4, h5, h6,
         input, textarea, button, select, label, li, td, th {
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif !important;
+            font-family: var(--ui-font) !important;
+            line-height: 1.5 !important;
         }
         /* Preserve Material Icons / Symbols fonts */
         [class*="material"], .material-icons, .material-symbols-rounded,
@@ -499,6 +505,34 @@ def inject_styles() -> None:
             position: relative !important;
         }
 
+        .cv-chat-bubble {
+            padding: 10px 12px;
+            border-radius: 12px;
+            margin-bottom: 10px;
+            border: 1px solid transparent;
+        }
+
+        .cv-chat-bubble strong {
+            display: block;
+            margin-bottom: 4px;
+            font-weight: 700;
+        }
+
+        .cv-chat-bubble-user {
+            background: var(--chat-user-bg);
+            border-color: var(--chat-user-border);
+        }
+
+        .cv-chat-bubble-assistant {
+            background: var(--chat-assistant-bg);
+            border-color: var(--chat-assistant-border);
+        }
+
+        /* Make save choices stand out clearly */
+        [data-testid="stRadio"] label {
+            font-weight: 700 !important;
+        }
+
         ::-webkit-scrollbar {
             width: 8px;
             height: 8px;
@@ -535,6 +569,7 @@ def inject_styles() -> None:
             .stRadio label,
             .stCheckbox label {
                 font-size: clamp(0.875rem, 3.5vw, 1rem) !important;
+                line-height: 1.55 !important;
             }
 
             /* Sidebar text */
@@ -552,6 +587,7 @@ def inject_styles() -> None:
                 font-size: clamp(0.85rem, 3vw, 1rem) !important;
                 padding: 10px 16px !important;
                 white-space: normal !important;
+                font-weight: 700 !important;
             }
 
             /* Chat messages */
@@ -1078,14 +1114,15 @@ def setup_ai_api_key_sidebar() -> None:
         type="password",
         placeholder="sk-...",
     )
+    api_key_clean = (api_key_input or "").strip()
 
     # Save API key to database when it changes
-    if api_key_input and api_key_input != st.session_state.get("openai_api_key", ""):
+    if api_key_clean and api_key_clean != st.session_state.get("openai_api_key", ""):
         if st.session_state.get("auth_user"):
             user_id = st.session_state["auth_user"]["id"]
-            success = db_save_openai_api_key(user_id, api_key_input)
+            success = db_save_openai_api_key(user_id, api_key_clean)
             if success:
-                st.session_state["openai_api_key"] = api_key_input
+                st.session_state["openai_api_key"] = api_key_clean
                 st.sidebar.success("✅ API key saved!")
             else:
                 st.sidebar.error("Failed to save API key")
@@ -1464,6 +1501,7 @@ def build_chatbot_recipe_draft(user_prompt: str) -> tuple[dict, str]:
     if not _is_recipe_prompt(prompt):
         return {}, "off_topic"
 
+    remote_error = ""
     try:
         remote_raw = call_chatgpt_for_recipe(prompt)
         # API may signal off-topic
@@ -1473,13 +1511,16 @@ def build_chatbot_recipe_draft(user_prompt: str) -> tuple[dict, str]:
         if remote_draft.get("title") and remote_draft.get("ingredients") and remote_draft.get("instructions"):
             return remote_draft, "copilot"
     except Exception as e:
-        # Show the error to user for debugging
-        st.error(str(e))
-        pass
+        # Save the remote error so UI can explain why fallback was used.
+        remote_error = str(e).strip()
 
     local_draft = build_local_chatbot_recipe_draft(prompt)
     if local_draft:
+        if remote_error:
+            st.session_state["chatbot_last_error"] = remote_error
         return local_draft, "fallback"
+    if remote_error:
+        st.session_state["chatbot_last_error"] = remote_error
     return {}, "empty"
 
 
@@ -1948,7 +1989,7 @@ def page_add() -> None:
         api_key, source = get_ai_token(provider)
         provider_label = "OpenAI (ChatGPT API)" if provider == "openai" else "GitHub Models"
         source_descriptions = {
-            "sidebar": "Using sidebar key (session only)",
+            "session": "Using sidebar/profile key",
             "secrets": "Using Streamlit secrets key",
             "env": "Using environment variable key",
             "none": "No API key found",
@@ -1976,8 +2017,14 @@ def page_add() -> None:
 
         # Display chat history
         for msg in st.session_state["recipe_chat_messages"]:
-            with st.chat_message(msg["role"]):
-                st.markdown(msg["content"])
+            role = str(msg.get("role") or "assistant").lower()
+            content = html.escape(str(msg.get("content") or "")).replace("\n", "<br>")
+            bubble_class = "cv-chat-bubble-user" if role == "user" else "cv-chat-bubble-assistant"
+            speaker = "You" if role == "user" else "RecipeSnap AI"
+            st.markdown(
+                f"<div class='cv-chat-bubble {bubble_class}'><strong>{speaker}</strong>{content}</div>",
+                unsafe_allow_html=True,
+            )
 
         # Chat input
         chat_prompt = st.chat_input("e.g., 'Quick pasta for 2 people' or 'Vegan chocolate cake'", key="recipe_chat_prompt")
@@ -2000,14 +2047,18 @@ def page_add() -> None:
         if chat_prompt:
             draft, chat_source = build_chatbot_recipe_draft(chat_prompt)
             st.session_state["recipe_chat_messages"].append({"role": "user", "content": chat_prompt})
+            chatbot_error_text = (st.session_state.pop("chatbot_last_error", "") or "").strip()
             if draft:
                 st.session_state["chatbot_recipe_draft"] = draft
                 st.session_state["chatbot_recipe_source"] = chat_source
                 source_label = provider_label if chat_source == "copilot" else "Local fallback"
+                fallback_notice = ""
+                if chatbot_error_text and chat_source == "fallback":
+                    fallback_notice = f"\n\n_OpenAI request failed: {chatbot_error_text}_"
                 st.session_state["recipe_chat_messages"].append(
                     {
                         "role": "assistant",
-                        "content": f"{format_draft_preview(draft)}\n\n_Source: {source_label}_",
+                        "content": f"{format_draft_preview(draft)}\n\n_Source: {source_label}_{fallback_notice}",
                     }
                 )
             elif chat_source == "off_topic":
@@ -2018,6 +2069,13 @@ def page_add() -> None:
                     }
                 )
             else:
+                if chatbot_error_text:
+                    st.session_state["recipe_chat_messages"].append(
+                        {
+                            "role": "assistant",
+                            "content": f"OpenAI request failed: {chatbot_error_text}",
+                        }
+                    )
                 st.session_state["recipe_chat_messages"].append(
                     {"role": "assistant", "content": "I could not generate a recipe for that request. Please add more detail."}
                 )
@@ -2026,6 +2084,7 @@ def page_add() -> None:
         if st.session_state.get("chatbot_recipe_draft"):
             source_label = provider_label if st.session_state.get("chatbot_recipe_source") == "copilot" else "Local fallback"
             st.info(f"📋 Generated recipe (source: {source_label})")
+            st.markdown("**Saving Option**")
             save_destination = st.radio(
                 "What would you like to do?",
                 options=["Keep as draft only", "Move to Add Recipe form", "Save directly to Recipe Library"],
@@ -2338,7 +2397,7 @@ def page_cook_mode() -> None:
 
         controls_1, controls_2 = st.columns([1, 1])
         with controls_1:
-            if st.button("Start Cooking", type="primary"):
+            if st.button("▶", type="primary", help="Start cooking"):
                 if not selected_ids:
                     st.warning("Please select at least one recipe.")
                 else:
@@ -2349,7 +2408,7 @@ def page_cook_mode() -> None:
                     st.session_state["scroll_to_cook"] = True
                     st.rerun()
         with controls_2:
-            if st.button("Reset Cook Mode"):
+            if st.button("↺", help="Reset cook mode"):
                 st.session_state.pop("cook_mode_selected_ids", None)
                 st.session_state.pop("cook_mode_target_servings", None)
                 st.session_state.pop("cook_recipe_index", None)
@@ -2420,7 +2479,7 @@ def page_cook_mode() -> None:
         with panel_2:
             step_nav_1, step_nav_2 = st.columns([1, 1])
             with step_nav_1:
-                if st.button("Previous Step"):
+                if st.button("⏮", help="Previous step"):
                     if step_index > 0:
                         st.session_state["cook_step_index"] = step_index - 1
                         set_cook_tip_popup(current_recipe)
@@ -2432,7 +2491,7 @@ def page_cook_mode() -> None:
                         set_cook_tip_popup(prev_recipe)
                     st.rerun()
             with step_nav_2:
-                if st.button("Next Step", type="primary"):
+                if st.button("⏭", type="primary", help="Next step"):
                     if step_index < len(steps) - 1:
                         st.session_state["cook_step_index"] = step_index + 1
                         set_cook_tip_popup(current_recipe)
@@ -2450,7 +2509,7 @@ def page_cook_mode() -> None:
 
         recipe_nav_1, recipe_nav_2 = st.columns([1, 1])
         with recipe_nav_1:
-            if st.button("Previous Recipe"):
+            if st.button("⏮", key="cook_prev_recipe_btn", help="Previous recipe"):
                 if recipe_index > 0:
                     st.session_state["cook_recipe_index"] = recipe_index - 1
                     st.session_state["cook_step_index"] = 0
@@ -2459,7 +2518,7 @@ def page_cook_mode() -> None:
                     st.rerun()
 
         with recipe_nav_2:
-            if st.button("Next Recipe"):
+            if st.button("⏭", key="cook_next_recipe_btn", help="Next recipe"):
                 if recipe_index < len(active_ids) - 1:
                     st.session_state["cook_recipe_index"] = recipe_index + 1
                     st.session_state["cook_step_index"] = 0
