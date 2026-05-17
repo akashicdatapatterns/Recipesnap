@@ -1,0 +1,19 @@
+#!/usr/bin/env sh
+set -eu
+
+# Block committing local Streamlit secrets file.
+if git diff --cached --name-only --diff-filter=ACMR | grep -qx ".streamlit/secrets.toml"; then
+  echo "ERROR: .streamlit/secrets.toml is staged. Unstage it before commit." >&2
+  exit 1
+fi
+
+# Detect common GitHub token patterns in added lines.
+TOKEN_PATTERN='(gh[pousr]_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{20,})'
+
+if git diff --cached -U0 --no-color | grep -E '^\+[^+]' | grep -Eiq "$TOKEN_PATTERN"; then
+  echo "ERROR: Potential GitHub token detected in staged changes." >&2
+  echo "Remove the secret, rotate credentials, and try again." >&2
+  exit 1
+fi
+
+exit 0
