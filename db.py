@@ -180,6 +180,10 @@ def init_db() -> None:
                     city              TEXT,
                     country           TEXT,
                     cooking_preference TEXT,
+                    openai_api_key    TEXT,
+                    gemini_api_key    TEXT,
+                    groq_api_key      TEXT,
+                    openrouter_api_key TEXT,
                     password_salt     VARCHAR(64) NOT NULL,
                     password_hash     VARCHAR(128) NOT NULL,
                     is_admin          SMALLINT NOT NULL DEFAULT 0 CHECK (is_admin IN (0,1)),
@@ -274,6 +278,12 @@ def init_db() -> None:
                 conn.execute("ALTER TABLE users ADD COLUMN is_blocked SMALLINT NOT NULL DEFAULT 0")
             if not _has_column("users", "openai_api_key"):
                 conn.execute("ALTER TABLE users ADD COLUMN openai_api_key TEXT")
+            if not _has_column("users", "gemini_api_key"):
+                conn.execute("ALTER TABLE users ADD COLUMN gemini_api_key TEXT")
+            if not _has_column("users", "groq_api_key"):
+                conn.execute("ALTER TABLE users ADD COLUMN groq_api_key TEXT")
+            if not _has_column("users", "openrouter_api_key"):
+                conn.execute("ALTER TABLE users ADD COLUMN openrouter_api_key TEXT")
 
             admin_user = conn.execute("SELECT id FROM users WHERE is_admin = 1 ORDER BY id ASC LIMIT 1").fetchone()
             if not admin_user:
@@ -320,6 +330,10 @@ def init_db() -> None:
                     city               TEXT,
                     country            TEXT,
                     cooking_preference TEXT,
+                    openai_api_key     TEXT,
+                    gemini_api_key     TEXT,
+                    groq_api_key       TEXT,
+                    openrouter_api_key TEXT,
                     password_salt      TEXT NOT NULL,
                     password_hash      TEXT NOT NULL,
                     is_admin           INTEGER NOT NULL DEFAULT 0 CHECK (is_admin IN (0,1)),
@@ -414,6 +428,12 @@ def init_db() -> None:
                 conn.execute("ALTER TABLE users ADD COLUMN is_blocked INTEGER NOT NULL DEFAULT 0")
             if not _has_column("users", "openai_api_key"):
                 conn.execute("ALTER TABLE users ADD COLUMN openai_api_key TEXT")
+            if not _has_column("users", "gemini_api_key"):
+                conn.execute("ALTER TABLE users ADD COLUMN gemini_api_key TEXT")
+            if not _has_column("users", "groq_api_key"):
+                conn.execute("ALTER TABLE users ADD COLUMN groq_api_key TEXT")
+            if not _has_column("users", "openrouter_api_key"):
+                conn.execute("ALTER TABLE users ADD COLUMN openrouter_api_key TEXT")
 
             admin_user = conn.execute("SELECT id FROM users WHERE is_admin = 1 ORDER BY id ASC LIMIT 1").fetchone()
             if not admin_user:
@@ -546,12 +566,24 @@ def authenticate_user(identifier: str, password: str) -> Optional[dict]:
     }
 
 
-def save_openai_api_key(user_id: int, api_key: str) -> bool:
-    """Save the OpenAI API key for a user."""
+AI_KEY_COLUMN_BY_PROVIDER = {
+    "openai": "openai_api_key",
+    "gemini": "gemini_api_key",
+    "groq": "groq_api_key",
+    "openrouter": "openrouter_api_key",
+}
+
+
+def save_provider_api_key(user_id: int, provider: str, api_key: str) -> bool:
+    """Save a provider API key for a user."""
+    provider_key = (provider or "").strip().lower()
+    column = AI_KEY_COLUMN_BY_PROVIDER.get(provider_key)
+    if not column:
+        return False
     try:
         with get_connection() as conn:
             conn.execute(
-                "UPDATE users SET openai_api_key = %s WHERE id = %s",
+                f"UPDATE users SET {column} = %s WHERE id = %s",
                 (api_key if api_key else None, user_id),
             )
         return True
@@ -559,17 +591,55 @@ def save_openai_api_key(user_id: int, api_key: str) -> bool:
         return False
 
 
-def get_openai_api_key(user_id: int) -> Optional[str]:
-    """Retrieve the OpenAI API key for a user."""
+def get_provider_api_key(user_id: int, provider: str) -> Optional[str]:
+    """Retrieve a provider API key for a user."""
+    provider_key = (provider or "").strip().lower()
+    column = AI_KEY_COLUMN_BY_PROVIDER.get(provider_key)
+    if not column:
+        return None
     try:
         with get_connection() as conn:
             row = conn.execute(
-                "SELECT openai_api_key FROM users WHERE id = %s",
+                f"SELECT {column} FROM users WHERE id = %s",
                 (user_id,),
             ).fetchone()
-        return str(row["openai_api_key"]) if row and row["openai_api_key"] else None
+        return str(row[column]) if row and row.get(column) else None
     except Exception:
         return None
+
+
+def get_all_provider_api_keys(user_id: int) -> dict:
+    """Retrieve all persisted provider API keys for a user."""
+    try:
+        with get_connection() as conn:
+            row = conn.execute(
+                """
+                SELECT openai_api_key, gemini_api_key, groq_api_key, openrouter_api_key
+                FROM users
+                WHERE id = %s
+                """,
+                (user_id,),
+            ).fetchone()
+        if not row:
+            return {}
+        return {
+            "openai": str(row.get("openai_api_key") or ""),
+            "gemini": str(row.get("gemini_api_key") or ""),
+            "groq": str(row.get("groq_api_key") or ""),
+            "openrouter": str(row.get("openrouter_api_key") or ""),
+        }
+    except Exception:
+        return {}
+
+
+def save_openai_api_key(user_id: int, api_key: str) -> bool:
+    """Backward-compatible wrapper for OpenAI key save."""
+    return save_provider_api_key(user_id, "openai", api_key)
+
+
+def get_openai_api_key(user_id: int) -> Optional[str]:
+    """Backward-compatible wrapper for OpenAI key retrieval."""
+    return get_provider_api_key(user_id, "openai")
 
 
 # ---------------------------------------------------------------------------

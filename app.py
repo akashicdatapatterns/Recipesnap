@@ -36,9 +36,9 @@ from db import (
     delete_user_session,
     delete_meal_plan_entry,
     export_recipes_records,
+    get_all_provider_api_keys as db_get_all_provider_api_keys,
     get_categories,
     get_difficulties,
-    get_openai_api_key as db_get_openai_api_key,
     get_recipe,
     get_session_user,
     get_user_by_id,
@@ -49,7 +49,7 @@ from db import (
     list_recipe_options,
     list_users_with_stats,
     reset_user_password,
-    save_openai_api_key as db_save_openai_api_key,
+    save_provider_api_key as db_save_provider_api_key,
     set_user_blocked,
     set_favorite,
     set_rating,
@@ -95,10 +95,16 @@ def page_auth() -> None:
             if user:
                 st.session_state["auth_user"] = user
                 st.session_state["page"] = "Browse Recipes"
-                # Load saved OpenAI API key from database
-                saved_key = db_get_openai_api_key(user["id"])
-                if saved_key:
-                    st.session_state["openai_api_key"] = saved_key
+                # Load saved provider API keys from database
+                saved_keys = db_get_all_provider_api_keys(user["id"])
+                if saved_keys.get("openai"):
+                    st.session_state["openai_api_key"] = saved_keys["openai"]
+                if saved_keys.get("gemini"):
+                    st.session_state["gemini_api_key"] = saved_keys["gemini"]
+                if saved_keys.get("groq"):
+                    st.session_state["groq_api_key"] = saved_keys["groq"]
+                if saved_keys.get("openrouter"):
+                    st.session_state["openrouter_api_key"] = saved_keys["openrouter"]
                 # Create persistent session token and store in cookie
                 try:
                     import extra_streamlit_components as stx
@@ -398,8 +404,6 @@ def inject_styles() -> None:
 
         .stTextInput > div > div > input,
         .stTextArea textarea,
-        .stSelectbox [data-baseweb="select"] > div,
-        .stMultiSelect [data-baseweb="select"] > div,
         .stNumberInput input,
         .stDateInput > div > div > input {
             border-radius: 8px !important;
@@ -407,29 +411,79 @@ def inject_styles() -> None:
             transition: all 0.3s ease !important;
         }
 
-        /* Force selectbox selected value visibility */
-        .stSelectbox [data-baseweb="select"] [role="combobox"] {
-            color: inherit !important;
-            fill: currentColor !important;
-            opacity: 1 !important;
-            visibility: visible !important;
+        /* Selectbox outer container: rounded border only, no padding override */
+        .stSelectbox [data-baseweb="select"] > div,
+        .stMultiSelect [data-baseweb="select"] > div {
+            border-radius: 8px !important;
+            transition: all 0.3s ease !important;
+        }
+
+        /* ── Dropdown / Select visibility fixes ── */
+
+        /* ── Core fix: div[value] collapses to height:0 in BaseWeb flex layout ── */
+        /* The selected-value div uses height:100% which resolves to 0 when parent
+           has no explicit CSS height. Force auto height so text is visible. */
+        .stSelectbox [data-baseweb="select"] div[value],
+        .stMultiSelect [data-baseweb="select"] div[value] {
+            height: auto !important;
+            min-height: 1.2em !important;
+            overflow: visible !important;
             display: flex !important;
             align-items: center !important;
+            color: #111111 !important;
+            flex-shrink: 1 !important;
         }
 
-        .stSelectbox [data-baseweb="select"] [role="combobox"] > div,
-        .stSelectbox [data-baseweb="select"] [role="combobox"] span {
-            color: inherit !important;
+        /* Also fix the inner flex row that wraps value + hidden input */
+        .stSelectbox [data-baseweb="select"] [role="combobox"],
+        .stMultiSelect [data-baseweb="select"] [role="combobox"] {
+            color: #111111 !important;
             opacity: 1 !important;
             visibility: visible !important;
-            display: inline-block !important;
         }
 
-        .stSelectbox [role="combobox"] > *,
-        .stMultiSelect [role="combobox"] > * {
-            color: inherit !important;
+        /* Dropdown option list popup — light */
+        [data-baseweb="popover"] [role="option"],
+        [data-baseweb="popover"] [role="listbox"] li,
+        [data-baseweb="menu"] [role="option"],
+        [data-baseweb="select"] ul li {
+            color: #111111 !important;
+            background-color: #ffffff !important;
             opacity: 1 !important;
             visibility: visible !important;
+        }
+        [data-baseweb="popover"] [role="option"]:hover,
+        [data-baseweb="menu"] [role="option"]:hover,
+        [data-baseweb="popover"] [aria-selected="true"],
+        [data-baseweb="menu"] [aria-selected="true"] {
+            background-color: rgba(78, 205, 196, 0.15) !important;
+            color: #111111 !important;
+        }
+
+        /* Dropdown arrow icon — light */
+        .stSelectbox [data-baseweb="select"] svg,
+        .stMultiSelect [data-baseweb="select"] svg {
+            fill: #444444 !important;
+            opacity: 1 !important;
+            visibility: visible !important;
+        }
+
+        /* Dark theme — Streamlit doesn't use data-theme; use OS media query only */
+        @media (prefers-color-scheme: dark) {
+            .stSelectbox [data-baseweb="select"] div[value],
+            .stMultiSelect [data-baseweb="select"] div[value] {
+                color: #f0f0f0 !important;
+            }
+            .stSelectbox [data-baseweb="select"] [role="combobox"],
+            .stMultiSelect [data-baseweb="select"] [role="combobox"] {
+                color: #f0f0f0 !important;
+            }
+            [data-baseweb="popover"] [role="option"],
+            [data-baseweb="popover"] [role="listbox"] li,
+            [data-baseweb="menu"] [role="option"] {
+                color: #f0f0f0 !important;
+                background-color: #2d2d2d !important;
+            }
         }
 
         .stTextInput > div > div > input:focus,
@@ -1053,52 +1107,131 @@ def parse_recipe_from_web_url(url_text: str) -> tuple[dict, str]:
     return parsed, strip_html_to_text(html_content)
 
 
+AI_PROVIDER_CONFIG: dict[str, dict] = {
+    "openai": {
+        "label": "OpenAI",
+        "models": ["gpt-4o-mini", "gpt-4.1-mini"],
+        "session_key": "openai_api_key",
+        "secret_key": "OPENAI_API_KEY",
+        "env_key": "OPENAI_API_KEY",
+        "token_placeholder": "sk-...",
+    },
+    "gemini": {
+        "label": "Google Gemini",
+        "models": ["gemini-1.5-flash", "gemini-1.5-flash-8b"],
+        "session_key": "gemini_api_key",
+        "secret_key": "GEMINI_API_KEY",
+        "env_key": "GEMINI_API_KEY",
+        "token_placeholder": "AIza...",
+    },
+    "groq": {
+        "label": "Groq",
+        "models": ["llama-3.1-8b-instant", "llama-3.3-70b-versatile"],
+        "session_key": "groq_api_key",
+        "secret_key": "GROQ_API_KEY",
+        "env_key": "GROQ_API_KEY",
+        "token_placeholder": "gsk_...",
+    },
+    "openrouter": {
+        "label": "OpenRouter",
+        "models": [
+            "meta-llama/llama-3.3-70b-instruct:free",
+            "deepseek/deepseek-v4-flash:free",
+            "nvidia/nemotron-3-super-120b-a12b:free",
+            "meta-llama/llama-3.2-3b-instruct:free",
+            "qwen/qwen3-coder:free",
+        ],
+        "session_key": "openrouter_api_key",
+        "secret_key": "OPENROUTER_API_KEY",
+        "env_key": "OPENROUTER_API_KEY",
+        "token_placeholder": "sk-or-...",
+    },
+    "ollama": {
+        "label": "Ollama (Local)",
+        "models": ["llama3.2:3b", "qwen2.5:3b", "phi3:mini"],
+        "session_key": "",
+        "secret_key": "",
+        "env_key": "",
+        "token_placeholder": "",
+    },
+}
+
+
 def get_ai_provider() -> str:
-    """Always return openai provider (ChatGPT only)."""
-    return "openai"
+    provider = str(st.session_state.get("ai_provider", "openai")).strip().lower()
+    return provider if provider in AI_PROVIDER_CONFIG else "openai"
+
+
+def mask_api_key(token: str) -> str:
+    """Return a masked representation of an API key for UI display."""
+    clean = str(token or "").strip()
+    if not clean:
+        return ""
+    if len(clean) <= 8:
+        return "*" * len(clean)
+    return f"{clean[:4]}{'*' * (len(clean) - 8)}{clean[-4:]}"
 
 
 def get_ai_token(provider: str | None = None) -> tuple[str, str]:
     """
-    Retrieve OpenAI API key with priority: session state -> secrets -> env var.
+    Retrieve provider key with priority: session state -> secrets -> env var.
     Returns: (token, source) where source is "session", "secrets", "env", or "none".
     """
-    # Check session state first (loaded from database on login or entered in sidebar)
-    session_value = str(st.session_state.get("openai_api_key", "")).strip()
-    if session_value:
-        return session_value, "session"
+    resolved_provider = (provider or get_ai_provider()).strip().lower()
+    config = AI_PROVIDER_CONFIG.get(resolved_provider, AI_PROVIDER_CONFIG["openai"])
 
-    # Check streamlit secrets
+    # Ollama typically runs locally and does not require an API key.
+    if resolved_provider == "ollama":
+        return "", "none"
+
+    session_key = config.get("session_key", "")
+    secret_key = config.get("secret_key", "")
+    env_key = config.get("env_key", "")
+
+    if session_key:
+        session_value = str(st.session_state.get(session_key, "")).strip()
+        if session_value:
+            return session_value, "session"
+
     secret_value = ""
-    try:
-        secret_value = str(st.secrets.get("OPENAI_API_KEY", "")).strip()
-    except Exception:
-        secret_value = ""
+    if secret_key:
+        try:
+            secret_value = str(st.secrets.get(secret_key, "")).strip()
+        except Exception:
+            secret_value = ""
     if secret_value:
         return secret_value, "secrets"
 
-    # Check environment variable
-    env_value = str(os.getenv("OPENAI_API_KEY") or "").strip()
+    env_value = str(os.getenv(env_key) or "").strip() if env_key else ""
     if env_value:
         return env_value, "env"
-    
+
     return "", "none"
 
 
 def setup_ai_api_key_sidebar() -> None:
-    """Render OpenAI API key input in sidebar and save to database."""
-    # Initialize session state for ChatGPT model
-    if "chatgpt_model" not in st.session_state:
-        st.session_state["chatgpt_model"] = "gpt-4o-mini"
-
+    """Render provider/model/key controls in sidebar."""
     st.sidebar.markdown("---")
-    st.sidebar.markdown("**🤖 AI Recipe Assistant (ChatGPT)**")
+    st.sidebar.markdown("**🤖 AI Recipe Assistant**")
 
-    # Display current model selection as radio buttons
-    model_options = ["gpt-4o-mini", "gpt-4o", "gpt-4.1-mini"]
-    current_model = st.session_state.get("chatgpt_model", "gpt-4o-mini")
+    # Provider selection
+    provider_options = list(AI_PROVIDER_CONFIG.keys())
+    if "ai_provider" not in st.session_state:
+        st.session_state["ai_provider"] = "openai"
+    current_provider = get_ai_provider()
+    provider_idx = provider_options.index(current_provider) if current_provider in provider_options else 0
+    selected_provider = st.sidebar.selectbox(
+        "Provider",
+        options=provider_options,
+        index=provider_idx,
+        format_func=lambda p: AI_PROVIDER_CONFIG[p]["label"],
+    )
+    st.session_state["ai_provider"] = selected_provider
+
+    # Model selection per provider
+    model_options = AI_PROVIDER_CONFIG[selected_provider]["models"]
+    current_model = str(st.session_state.get("chatgpt_model", model_options[0])).strip()
     model_idx = model_options.index(current_model) if current_model in model_options else 0
-
     st.sidebar.radio(
         "Model",
         options=model_options,
@@ -1106,49 +1239,141 @@ def setup_ai_api_key_sidebar() -> None:
         key="chatgpt_model",
         horizontal=False,
     )
-
-    # OpenAI API key input - with save to database
-    api_key_input = st.sidebar.text_input(
-        "OpenAI API key",
-        value=st.session_state.get("openai_api_key", ""),
-        type="password",
-        placeholder="sk-...",
+    st.sidebar.caption(
+        "Free-tier friendly options: Gemini Flash, Groq Llama, OpenRouter :free models, and local Ollama."
     )
-    api_key_clean = (api_key_input or "").strip()
 
-    # Save API key to database when it changes
-    if api_key_clean and api_key_clean != st.session_state.get("openai_api_key", ""):
-        if st.session_state.get("auth_user"):
-            user_id = st.session_state["auth_user"]["id"]
-            success = db_save_openai_api_key(user_id, api_key_clean)
-            if success:
-                st.session_state["openai_api_key"] = api_key_clean
-                st.sidebar.success("✅ API key saved!")
-            else:
-                st.sidebar.error("Failed to save API key")
+    # Provider-specific connection fields
+    provider_config = AI_PROVIDER_CONFIG[selected_provider]
+    if selected_provider == "ollama":
+        st.session_state["ollama_base_url"] = st.sidebar.text_input(
+            "Ollama base URL",
+            value=str(st.session_state.get("ollama_base_url", "http://127.0.0.1:11434")).strip(),
+            placeholder="http://127.0.0.1:11434",
+        ).strip() or "http://127.0.0.1:11434"
+        status_icon = "✅"
+        with st.sidebar.expander(f"{status_icon} Connect AI", expanded=False):
+            st.markdown(
+                "**Ollama Local Setup:**\n"
+                "1. Install Ollama\n"
+                "2. Run a model, e.g. `ollama run llama3.2:3b`\n"
+                "3. Keep Ollama running at the base URL above"
+            )
+        return
 
-    # Clear key button
-    if st.sidebar.button("Clear Key", key="clear_api_key"):
-        if st.session_state.get("auth_user"):
-            user_id = st.session_state["auth_user"]["id"]
-            db_save_openai_api_key(user_id, "")
-            st.session_state["openai_api_key"] = ""
-            st.rerun()
+    session_key = provider_config["session_key"]
+    key_label = f"{provider_config['label']} API key"
+    current_saved_key = str(st.session_state.get(session_key, "")).strip()
+    edit_mode_key = f"edit_mode_{session_key}"
+    if edit_mode_key not in st.session_state:
+        st.session_state[edit_mode_key] = False
 
-    # Check if API key is available
-    api_key, source = get_ai_token()
-    status_icon = "✅" if api_key else "⚠️"
-    
-    with st.sidebar.expander(f"{status_icon} Connect AI", expanded=not bool(api_key)):
-        st.markdown(
-            "**Get your OpenAI API key:**\n"
-            "1. Go to [platform.openai.com](https://platform.openai.com/account/api-keys)\n"
-            "2. Create a new API key\n"
-            "3. Paste it below (saves to your profile for next login)"
+    if current_saved_key and not bool(st.session_state.get(edit_mode_key)):
+        st.sidebar.text_input(
+            key_label,
+            value=mask_api_key(current_saved_key),
+            type="default",
+            disabled=True,
         )
+        if st.sidebar.button("Update Key", key=f"update_api_key_{selected_provider}"):
+            st.session_state[edit_mode_key] = True
+            st.rerun()
+    else:
+        api_key_input = st.sidebar.text_input(
+            key_label,
+            value="",
+            type="password",
+            placeholder=provider_config["token_placeholder"],
+            key=f"api_key_input_{selected_provider}",
+        )
+        api_key_clean = (api_key_input or "").strip()
+
+        # Save key in session and database.
+        if api_key_clean and api_key_clean != current_saved_key:
+            st.session_state[session_key] = api_key_clean
+            st.session_state[edit_mode_key] = False
+            if st.session_state.get("auth_user"):
+                user_id = st.session_state["auth_user"]["id"]
+                success = db_save_provider_api_key(user_id, selected_provider, api_key_clean)
+                if success:
+                    st.sidebar.success("✅ API key saved!")
+                else:
+                    st.sidebar.error("Failed to save API key")
+
+    clear_key_btn = f"clear_api_key_{selected_provider}"
+    if st.sidebar.button("Clear Key", key=clear_key_btn):
+        st.session_state[session_key] = ""
+        st.session_state[edit_mode_key] = False
+        if st.session_state.get("auth_user"):
+            user_id = st.session_state["auth_user"]["id"]
+            db_save_provider_api_key(user_id, selected_provider, "")
+        st.rerun()
+
+    api_key, source = get_ai_token(selected_provider)
+    status_icon = "✅" if api_key else "⚠️"
+    with st.sidebar.expander(f"{status_icon} Connect AI", expanded=not bool(api_key)):
+        if selected_provider == "openai":
+            st.markdown(
+                "**Get your OpenAI API key:**\n"
+                "1. Go to [platform.openai.com](https://platform.openai.com/account/api-keys)\n"
+                "2. Create a new API key\n"
+                "3. Paste it above"
+            )
+            if api_key:
+                is_valid, diagnostic = validate_openai_key_format(api_key)
+                if is_valid:
+                    st.success(f"✅ {diagnostic}")
+                else:
+                    st.warning(f"⚠️ **Key format issue:** {diagnostic}")
+        elif selected_provider == "gemini":
+            st.markdown(
+                "**Get your Gemini API key:**\n"
+                "1. Go to [aistudio.google.com](https://aistudio.google.com/app/apikey)\n"
+                "2. Create API key\n"
+                "3. Paste it above"
+            )
+        elif selected_provider == "groq":
+            st.markdown(
+                "**Get your Groq API key:**\n"
+                "1. Go to [console.groq.com/keys](https://console.groq.com/keys)\n"
+                "2. Create API key\n"
+                "3. Paste it above"
+            )
+        elif selected_provider == "openrouter":
+            st.markdown(
+                "**Get your OpenRouter API key:**\n"
+                "1. Go to [openrouter.ai/keys](https://openrouter.ai/keys)\n"
+                "2. Create API key\n"
+                "3. Paste it above"
+            )
+        if api_key:
+            st.caption(f"Using key from: {source}")
 
 
 # Keep the old name as an alias so existing call sites keep working.
+def validate_openai_key_format(token: str) -> tuple[bool, str]:
+    """
+    Validate OpenAI API key format.
+    Returns: (is_valid, diagnostic_message)
+    """
+    if not token:
+        return False, "No API key provided"
+    
+    if len(token) < 20:
+        return False, f"Key too short ({len(token)} chars, expected 40-50+). Likely truncated."
+    
+    if not (token.startswith("sk-") or token.startswith("sk_")):
+        return False, "Key doesn't start with 'sk-' or 'sk_'. Check for copy/paste errors."
+    
+    if len(token) > 80:
+        return False, f"Key too long ({len(token)} chars, expected ~48 for standard keys). May have extra whitespace."
+    
+    if any(c in token for c in ['\n', '\r', '\t']):
+        return False, "Key contains newlines or tabs. Try re-entering it."
+    
+    return True, f"Key format looks valid ({len(token)} chars)"
+
+
 def get_openai_api_key() -> str:
     """
     Backward compatibility wrapper. Returns just the token string.
@@ -1158,10 +1383,21 @@ def get_openai_api_key() -> str:
     return token
 
 
+# Simple in-memory cache for recipe API responses to reduce quota waste
+_recipe_cache: dict[str, dict] = {}
+
+
 def call_chatgpt_for_recipe(user_prompt: str) -> dict:
     provider = get_ai_provider()
     token, _ = get_ai_token(provider)
-    if not token:
+    
+    # Check cache first to avoid duplicate API calls
+    cache_key = f"{provider}:{hash(user_prompt.lower())}"
+    if cache_key in _recipe_cache:
+        print(f"[DEBUG] Cache hit for prompt (saved API call)")
+        return _recipe_cache[cache_key]
+    
+    if provider != "ollama" and not token:
         if provider == "openai":
             raise RuntimeError(
                 "❌ OpenAI API key not found.\n\n"
@@ -1169,16 +1405,33 @@ def call_chatgpt_for_recipe(user_prompt: str) -> dict:
                 "1. Get your API key: [platform.openai.com/account/api-keys](https://platform.openai.com/account/api-keys)\n"
                 "2. Enter it in the **Connect AI** section in the sidebar"
             )
+        if provider == "gemini":
+            raise RuntimeError(
+                "❌ Gemini API key not found.\n\n"
+                "**How to fix:**\n"
+                "1. Get your API key: [aistudio.google.com/app/apikey](https://aistudio.google.com/app/apikey)\n"
+                "2. Enter it in the **Connect AI** section in the sidebar"
+            )
+        if provider == "groq":
+            raise RuntimeError(
+                "❌ Groq API key not found.\n\n"
+                "**How to fix:**\n"
+                "1. Get your API key: [console.groq.com/keys](https://console.groq.com/keys)\n"
+                "2. Enter it in the **Connect AI** section in the sidebar"
+            )
+        if provider == "openrouter":
+            raise RuntimeError(
+                "❌ OpenRouter API key not found.\n\n"
+                "**How to fix:**\n"
+                "1. Get your API key: [openrouter.ai/keys](https://openrouter.ai/keys)\n"
+                "2. Enter it in the **Connect AI** section in the sidebar"
+            )
         raise RuntimeError(
-            "❌ GitHub token not found.\n\n"
-            "**How to fix:**\n"
-            "1. Get your token: [github.com/settings/tokens](https://github.com/settings/tokens)\n"
-            "2. Enter it in the **Connect AI** section in the sidebar"
+            "❌ API key not found for selected provider."
         )
 
-    payload = {
-        "model": str(st.session_state.get("chatgpt_model", "gpt-4o-mini")),
-        "messages": [
+    selected_model = str(st.session_state.get("chatgpt_model", "gpt-4o-mini")).strip()
+    messages = [
             {
                 "role": "system",
                 "content": (
@@ -1197,65 +1450,231 @@ def call_chatgpt_for_recipe(user_prompt: str) -> dict:
                 "role": "user",
                 "content": user_prompt,
             },
-        ],
+        ]
+
+    payload: dict = {
+        "model": selected_model,
+        "messages": messages,
         "temperature": 0.6,
     }
 
-    endpoint = "https://api.openai.com/v1/chat/completions" if provider == "openai" else "https://models.inference.ai.azure.com/chat/completions"
+    if provider == "openai":
+        endpoint = "https://api.openai.com/v1/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "User-Agent": "RecipeSnap/1.0 (+http://localhost)",
+        }
+    elif provider == "groq":
+        endpoint = "https://api.groq.com/openai/v1/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "User-Agent": "RecipeSnap/1.0 (+http://localhost)",
+        }
+    elif provider == "openrouter":
+        endpoint = "https://openrouter.ai/api/v1/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": "http://localhost:8501",
+            "X-Title": "RecipeSnap",
+            "User-Agent": "RecipeSnap/1.0 (+http://localhost)",
+        }
+    elif provider == "gemini":
+        endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{selected_model}:generateContent?key={token}"
+        headers = {
+            "Content-Type": "application/json",
+            "User-Agent": "RecipeSnap/1.0 (+http://localhost)",
+        }
+        payload = {
+            "contents": [
+                {
+                    "parts": [
+                        {
+                            "text": (
+                                "You are a recipe-only assistant. Return JSON only with keys: "
+                                "title, description, ingredients, instructions, tips_for_best_result, "
+                                "servings, prep_time, cook_time, difficulty, category, tags, ingredient_format. "
+                                "ingredients format must be 'quantity : item' per line. "
+                                "ingredient_format must be 'quantity_item'.\n\n"
+                                f"User request: {user_prompt}"
+                            )
+                        }
+                    ]
+                }
+            ],
+            "generationConfig": {"temperature": 0.6},
+        }
+    else:
+        base_url = str(st.session_state.get("ollama_base_url", "http://127.0.0.1:11434")).strip()
+        base_url = base_url.rstrip("/")
+        endpoint = f"{base_url}/api/chat"
+        headers = {
+            "Content-Type": "application/json",
+            "User-Agent": "RecipeSnap/1.0 (+http://localhost)",
+        }
+        payload = {
+            "model": selected_model,
+            "messages": messages,
+            "stream": False,
+        }
+    
+    # Debug logging: mask token but show length and format for troubleshooting
+    token_preview = f"{token[:10]}...{token[-5:]}" if len(token) > 15 else "***"
+    print(f"[DEBUG] API Request Details:")
+    print(f"  Provider: {provider}")
+    print(f"  Token: {token_preview} ({len(token)} chars)")
+    print(f"  Model: {payload.get('model')}")
+    print(f"  Endpoint: {endpoint}")
+    
     req = Request(
         endpoint,
         data=json.dumps(payload).encode("utf-8"),
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json",
-        },
+        headers=headers,
         method="POST",
     )
 
     try:
         with urlopen(req, timeout=35) as response:
             result = json.loads(response.read().decode("utf-8", errors="ignore"))
+            print(f"[DEBUG] Success! Response status: {response.status}")
     except HTTPError as exc:
         body = exc.read().decode("utf-8", errors="ignore") if hasattr(exc, "read") else ""
-        service_name = "OpenAI" if provider == "openai" else "GitHub Models"
+        print(f"[DEBUG] HTTP Error {exc.code}: {body[:500]}")
+        service_name = AI_PROVIDER_CONFIG.get(provider, {}).get("label", "AI Provider")
+        
+        # Parse JSON error body for more details
+        error_detail = ""
+        try:
+            error_json = json.loads(body)
+            if "error" in error_json:
+                error_msg = error_json["error"].get("message", "")
+                error_code = error_json["error"].get("code", "")
+                if "model" in error_msg.lower() or "model_not" in error_code.lower():
+                    error_detail = (
+                        f"\n\n**Model Access Issue:** {error_msg}\n"
+                        f"Try selecting a different model (gpt-3.5-turbo is most widely available)."
+                    )
+                elif "invalid" in error_msg.lower() or "key" in error_msg.lower():
+                    error_detail = f"\n\n**API Key Issue:** {error_msg}"
+        except:
+            pass
+        
         if exc.code == 401:
+            is_valid, diagnostic = validate_openai_key_format(token)
+            diagnostic_msg = f"\n\n**Key Format Check:** {diagnostic}" if not is_valid else ""
             raise RuntimeError(
                 f"❌ {service_name} authentication failed.\n\n"
                 "**Your API key might be invalid or expired.**\n"
                 "1. Check that your key is correct and not truncated\n"
                 "2. Visit [platform.openai.com/account/api-keys](https://platform.openai.com/account/api-keys) to regenerate it\n"
                 "3. Re-enter it in the **Connect AI** section"
+                f"{diagnostic_msg}"
             ) from exc
         if exc.code == 429:
+            # Parse retry_after from header or body
+            retry_after_secs = 30
+            try:
+                if hasattr(exc, "headers") and exc.headers.get("Retry-After"):
+                    retry_after_secs = int(exc.headers.get("Retry-After", 30))
+            except Exception:
+                pass
+            try:
+                err_json = json.loads(body)
+                ra = err_json.get("error", {}).get("metadata", {}).get("retry_after_seconds")
+                if ra:
+                    retry_after_secs = int(float(ra)) + 1
+            except Exception:
+                pass
+
+            # OpenRouter free-tier upstream rate limit — auto-retry once
+            if provider == "openrouter":
+                upstream_msg = ""
+                try:
+                    err_json = json.loads(body)
+                    upstream_msg = err_json.get("error", {}).get("metadata", {}).get("raw", "")
+                except Exception:
+                    pass
+                print(f"[DEBUG] OpenRouter 429 — upstream rate limit. Waiting {retry_after_secs}s then retrying…")
+                import time as _time
+                _time.sleep(retry_after_secs)
+                # Single retry
+                try:
+                    with urlopen(req, timeout=35) as _r:
+                        result = json.loads(_r.read().decode("utf-8", errors="ignore"))
+                        print("[DEBUG] Retry succeeded.")
+                except HTTPError as retry_exc:
+                    retry_body = retry_exc.read().decode("utf-8", errors="ignore") if hasattr(retry_exc, "read") else ""
+                    raise RuntimeError(
+                        f"❌ OpenRouter free-tier model is still rate-limited.\n\n"
+                        f"**Cause:** {upstream_msg or 'Upstream provider temporarily busy.'}\n\n"
+                        "**What to do:**\n"
+                        "• Wait 1–2 minutes and try again\n"
+                        "• Switch to a different model in the sidebar (e.g. `nvidia/nemotron-3-super-120b-a12b:free`)\n"
+                        "• Free models on OpenRouter share rate limits across all users"
+                    ) from retry_exc
+            else:
+                if provider == "openai":
+                    raise RuntimeError(
+                        f"❌ Rate limit exceeded on {service_name}.\n\n"
+                        "**Your API quota is exhausted.**\n\n"
+                        "**What to do:**\n"
+                        "1. Visit [platform.openai.com/account/billing/overview](https://platform.openai.com/account/billing/overview)\n"
+                        "2. Add a payment method or upgrade\n"
+                        f"3. Try again in ~{retry_after_secs} seconds"
+                    ) from exc
+                else:
+                    raise RuntimeError(
+                        f"❌ Rate limit exceeded on {service_name}.\n\n"
+                        f"Try again in ~{retry_after_secs} seconds."
+                    ) from exc
+        if exc.code == 400 or exc.code == 404:
             raise RuntimeError(
-                f"❌ Rate limit exceeded on {service_name}.\n\n"
-                "You've hit the API quota. Try again in a moment."
+                f"❌ {service_name} request error (HTTP {exc.code}).\n\n"
+                f"{body[:300]}"
+                f"{error_detail}"
             ) from exc
         raise RuntimeError(f"❌ {service_name} request failed (HTTP {exc.code}).\n\n{body[:200]}") from exc
     except URLError as exc:
-        service_name = "OpenAI" if provider == "openai" else "GitHub Models"
+        service_name = AI_PROVIDER_CONFIG.get(provider, {}).get("label", "AI Provider")
         raise RuntimeError(
             f"❌ Unable to reach {service_name}. Check your internet connection."
         ) from exc
 
-    content = (
-        result.get("choices", [{}])[0]
-        .get("message", {})
-        .get("content", "")
-        .strip()
-    )
+    if provider in {"openai", "groq", "openrouter"}:
+        content = (
+            result.get("choices", [{}])[0]
+            .get("message", {})
+            .get("content", "")
+            .strip()
+        )
+    elif provider == "gemini":
+        parts = (
+            result.get("candidates", [{}])[0]
+            .get("content", {})
+            .get("parts", [])
+        )
+        content = "\n".join(str(part.get("text", "")) for part in parts if isinstance(part, dict)).strip()
+    else:
+        content = str(result.get("message", {}).get("content", "")).strip()
+
     if not content:
-        service_name = "OpenAI" if provider == "openai" else "GitHub Models"
+        service_name = AI_PROVIDER_CONFIG.get(provider, {}).get("label", "AI Provider")
         raise RuntimeError(f"❌ {service_name} returned an empty response.")
 
     try:
-        return json.loads(content)
+        parsed = json.loads(content)
+        _recipe_cache[cache_key] = parsed
+        return parsed
     except json.JSONDecodeError:
         match = re.search(r"\{[\s\S]*\}", content)
         if not match:
-            service_name = "OpenAI" if provider == "openai" else "GitHub Models"
+            service_name = AI_PROVIDER_CONFIG.get(provider, {}).get("label", "AI Provider")
             raise RuntimeError(f"❌ {service_name} response was not valid JSON.")
-        return json.loads(match.group(0))
+        parsed = json.loads(match.group(0))
+        _recipe_cache[cache_key] = parsed
+        return parsed
 
 
 def normalize_generated_recipe(raw: dict, source_prompt: str) -> dict:
@@ -1510,17 +1929,14 @@ def build_chatbot_recipe_draft(user_prompt: str) -> tuple[dict, str]:
         remote_draft = normalize_generated_recipe(remote_raw, prompt)
         if remote_draft.get("title") and remote_draft.get("ingredients") and remote_draft.get("instructions"):
             return remote_draft, "copilot"
+        remote_error = "AI response format was incomplete. Please try again with a clearer recipe request."
     except Exception as e:
-        # Save the remote error so UI can explain why fallback was used.
+        # Save the remote error so UI can show the exact provider issue.
         remote_error = str(e).strip()
 
-    local_draft = build_local_chatbot_recipe_draft(prompt)
-    if local_draft:
-        if remote_error:
-            st.session_state["chatbot_last_error"] = remote_error
-        return local_draft, "fallback"
     if remote_error:
         st.session_state["chatbot_last_error"] = remote_error
+        return {}, "error"
     return {}, "empty"
 
 
@@ -1982,30 +2398,44 @@ def page_add() -> None:
     else:
         st.markdown("### 🤖 Chatbot Recipe Assistant")
         st.caption(
-            "Describe what you want to cook. If your provider key is connected, live AI generates the draft; otherwise local fallback is used."
+            "Describe what you want to cook. The app will use your connected AI provider and show the exact error if generation fails."
         )
 
         provider = get_ai_provider()
         api_key, source = get_ai_token(provider)
-        provider_label = "OpenAI (ChatGPT API)" if provider == "openai" else "GitHub Models"
-        source_descriptions = {
-            "session": "Using sidebar/profile key",
-            "secrets": "Using Streamlit secrets key",
-            "env": "Using environment variable key",
-            "none": "No API key found",
-        }
+        provider_cfg = AI_PROVIDER_CONFIG.get(provider, AI_PROVIDER_CONFIG["openai"])
+        provider_label = provider_cfg["label"]
+        current_model = st.session_state.get("ai_model") or (provider_cfg["models"][0] if provider_cfg["models"] else "")
+        is_ollama = provider == "ollama"
+        is_connected = bool(api_key) or is_ollama
 
-        source_msg = source_descriptions.get(source, "Unknown source")
-        if source == "none":
-            st.warning(f"⚠️ **{provider_label}** — {source_msg}. Using local fallback templates.")
-            st.markdown(
-                "💡 **To use live AI:** \n"
-                f"- Get your API key from [platform.openai.com](https://platform.openai.com/account/api-keys) (OpenAI) "
-                f"or [github.com/settings/tokens](https://github.com/settings/tokens) (GitHub)\n"
-                f"- Enter it in the **Connect AI** section in the sidebar"
+        source_descriptions = {
+            "session": "key stored in profile",
+            "secrets": "key from Streamlit secrets",
+            "env": "key from environment variable",
+            "none": "no API key configured",
+        }
+        source_msg = source_descriptions.get(source, "unknown source")
+
+        if is_connected:
+            model_display = f"`{current_model}`" if current_model else ""
+            key_note = "no key needed — runs locally" if is_ollama else source_msg
+            st.success(
+                f"✅ **{provider_label}** connected — model: {model_display} ({key_note})"
             )
         else:
-            st.success(f"✅ **{provider_label}** connected — {source_msg}")
+            st.warning(f"⚠️ **{provider_label}** — {source_msg}. Connect a key to generate recipes.")
+            key_links = {
+                "openai": "https://platform.openai.com/account/api-keys",
+                "gemini": "https://aistudio.google.com/app/apikey",
+                "groq": "https://console.groq.com/keys",
+                "openrouter": "https://openrouter.ai/keys",
+            }
+            key_url = key_links.get(provider, "")
+            key_hint = f"[Get your {provider_label} API key]({key_url})" if key_url else f"Get a {provider_label} API key"
+            st.markdown(
+                f"💡 **To use live AI:** {key_hint}, then enter it in the **Connect AI** section in the sidebar."
+            )
 
         if "recipe_chat_messages" not in st.session_state:
             st.session_state["recipe_chat_messages"] = [
@@ -2051,14 +2481,11 @@ def page_add() -> None:
             if draft:
                 st.session_state["chatbot_recipe_draft"] = draft
                 st.session_state["chatbot_recipe_source"] = chat_source
-                source_label = provider_label if chat_source == "copilot" else "Local fallback"
-                fallback_notice = ""
-                if chatbot_error_text and chat_source == "fallback":
-                    fallback_notice = f"\n\n_OpenAI request failed: {chatbot_error_text}_"
+                source_label = provider_label
                 st.session_state["recipe_chat_messages"].append(
                     {
                         "role": "assistant",
-                        "content": f"{format_draft_preview(draft)}\n\n_Source: {source_label}_{fallback_notice}",
+                        "content": f"{format_draft_preview(draft)}\n\n_Source: {source_label}_",
                     }
                 )
             elif chat_source == "off_topic":
@@ -2073,16 +2500,20 @@ def page_add() -> None:
                     st.session_state["recipe_chat_messages"].append(
                         {
                             "role": "assistant",
-                            "content": f"OpenAI request failed: {chatbot_error_text}",
+                            "content": f"{provider_label} request failed: {chatbot_error_text}",
                         }
                     )
-                st.session_state["recipe_chat_messages"].append(
-                    {"role": "assistant", "content": "I could not generate a recipe for that request. Please add more detail."}
-                )
+                else:
+                    st.session_state["recipe_chat_messages"].append(
+                        {
+                            "role": "assistant",
+                            "content": "I could not generate a recipe for that request. Please try again with more detail.",
+                        }
+                    )
             st.rerun()
 
         if st.session_state.get("chatbot_recipe_draft"):
-            source_label = provider_label if st.session_state.get("chatbot_recipe_source") == "copilot" else "Local fallback"
+            source_label = provider_label if st.session_state.get("chatbot_recipe_source") == "copilot" else "AI"
             st.info(f"📋 Generated recipe (source: {source_label})")
             st.markdown("**Saving Option**")
             save_destination = st.radio(
@@ -2555,9 +2986,15 @@ def main() -> None:
         if restored_user:
             st.session_state["auth_user"] = restored_user
             st.session_state["cv_session_token"] = session_token
-            saved_key = db_get_openai_api_key(restored_user["id"])
-            if saved_key:
-                st.session_state["openai_api_key"] = saved_key
+            saved_keys = db_get_all_provider_api_keys(restored_user["id"])
+            if saved_keys.get("openai"):
+                st.session_state["openai_api_key"] = saved_keys["openai"]
+            if saved_keys.get("gemini"):
+                st.session_state["gemini_api_key"] = saved_keys["gemini"]
+            if saved_keys.get("groq"):
+                st.session_state["groq_api_key"] = saved_keys["groq"]
+            if saved_keys.get("openrouter"):
+                st.session_state["openrouter_api_key"] = saved_keys["openrouter"]
 
     if not get_active_user():
         page_auth()
